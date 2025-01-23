@@ -5,8 +5,6 @@ import os
 import random
 import time
 from collections import deque
-from datetime import date, datetime, timezone
-from datetime import time as dtime
 from pathlib import Path
 from threading import Condition, Lock
 from typing import Any, Dict, List, Optional
@@ -20,49 +18,100 @@ class MultiSingletonMeta(type):
     _instances = {}  # (cls, key) -> instance
 
     def __call__(cls, *args, **kwargs):
-        # 例如从 kwargs 中取一个 'task_id' 作为区分
         task_id = kwargs.get("task_id", None)
         if task_id is None:
-            # 如果没有传入 task_id，可以决定返回一个默认key的单例
             task_id = "default"
 
-        # 确定字典的键
         dict_key = (cls, task_id)
-
-        # 如果没有对应实例，则创建并存储
         if dict_key not in cls._instances:
             instance = super().__call__(*args, **kwargs)
             cls._instances[dict_key] = instance
 
-        # 返回已经存在的实例
         return cls._instances[dict_key]
 
 
-# ========== KeyManager Class ==========
+class RateLimitRule:
+    """
+    表示一个限速规则：在 timeframe_s 秒的滚动窗口内，最多允许 max_requests 次请求。
+    用户可以通过传入 (interval, time_unit) 的方式，在内部自动转换为秒。
+    例如：
+        - RateLimitRule(5, interval=1, time_unit="second")  -> 1秒内最多5次
+        - RateLimitRule(15, interval=1, time_unit="minute") -> 1分钟内最多15次
+        - RateLimitRule(100, interval=1, time_unit="hour")  -> 1小时内最多100次
+        - RateLimitRule(5000, interval=1, time_unit="day")  -> 1天内最多5000次
+        - RateLimitRule(60000, interval=1, time_unit="month")-> 约1个月(30天)内最多60000次
+    """
+
+    _TIME_UNIT_MAP = {
+        "second": 1,
+        "seconds": 1,
+        "sec": 1,
+        "minute": 60,
+        "minutes": 60,
+        "min": 60,
+        "hour": 3600,
+        "hours": 3600,
+        "day": 86400,
+        "days": 86400,
+        "d": 86400,
+        "month": 2592000,  # 30天近似值
+        "months": 2592000,
+        "mth": 2592000,
+        "year": 31536000,  # 365天近似值
+        "years": 31536000,
+        "y": 31536000,
+    }
+
+    def __init__(
+        self,
+        max_requests: int,
+        interval: int | float = 1,
+        time_unit: str = "second",
+    ):
+        """
+        :param max_requests: 在给定( interval, time_unit )时间内允许的最大请求次数
+        :param interval: 时间跨度的数量 (默认=1)
+        :param time_unit: 时间单位，可选：second、minute、hour、day、month、year 等
+        """
+        time_unit_lower = time_unit.lower().strip()
+        if time_unit_lower not in self._TIME_UNIT_MAP:
+            raise ValueError(f"不支持的 time_unit: {time_unit}")
+
+        self.timeframe_s = int(interval * self._TIME_UNIT_MAP[time_unit_lower])
+        self.max_requests = max_requests
+
+    def __repr__(self):
+        return f"<RateLimitRule {self.timeframe_s}s/{self.max_requests}req>"
+
+
 class Pool(metaclass=MultiSingletonMeta):
     def __init__(
         self,
-        rpm: int = 15,
-        rpd: Optional[int] = None,
+        limits: List[RateLimitRule] = [],
         allow_concurrent: bool = False,
         cooldown_time: int = 60,
         task_id: str = None,
+        persist: bool = False,
     ):
         """
-        :param rpm: 每分钟每个密钥可用的请求次数上限
+        :param limits: 一组限速规则，例如：
+               [RateLimitRule(5, 1, "second"), RateLimitRule(15, 1, "minute")]
         :param allow_concurrent: 是否允许同一密钥在同一时间段内被并发使用
-        :param cooldown_time: 密钥进入冷却状态的持续时间（秒）
+        :param cooldown_time: 普通冷却时长（秒）
+        :param usage_path: 若需持久化记录（尤其是大时间窗口），可指定保存使用记录的文件路径
+        :param persist: 是否启用持久化
         """
         if not task_id:
             raise ValueError("task_id is required")
+
         self.task_id = task_id
-        self.rpm = rpm
-        self.rpd = rpd
+        self.limits = limits
         self.allow_concurrent = allow_concurrent
         self.cooldown_time = cooldown_time
+        self.persist = persist
 
-        # 每个密钥对应的请求时间戳队列，用于计算 RPM 限制
-        self.request_counts: Dict[str, deque] = {}
+        # 每个密钥对应的【时间戳队列】，保存最近的请求时间（秒级）
+        self.request_timestamps: Dict[str, deque] = {}
 
         # 冷却中的密钥，值为冷却结束的时间戳
         self.cooldown_keys: Dict[str, float] = {}
@@ -75,118 +124,116 @@ class Pool(metaclass=MultiSingletonMeta):
         self._lock = Lock()
         self._condition = Condition(self._lock)
 
-        # 每个 key 的当日使用计数 key_hash -> int
-        self.daily_usage_counts: Dict[str, int] = {"which_day": str(date.today())}
-        self.usage_path: Path = Path(f"cache/{self.task_id}_daily_usage_counts.json")
-        # 用来判断是否到了新的一天，需要重置计数
-        self._day_tag: Optional[date] = None
-
-        # 从缓存中加载当日使用计数
-        if rpd:
+        # 用于持久化 request_timestamps
+        self.usage_path: Optional[Path] = Path(f"persist/{self.task_id}.usage.json")
+        if self.persist and self.usage_path is not None:
             self.load_usage()
-
             atexit.register(self.save_usage)
-
-    def _reset_daily_usage_if_needed(self):
-        """
-        如果今天已变更（跨日），就重置所有 key 的当日使用计数
-        """
-        today = datetime.now(timezone.utc).date().isoformat()
-        if self._day_tag != today:
-            # 新的一天，重置计数
-            self.daily_usage_counts = {"which_day": today}
-            self._day_tag = today
-            self.save_usage()
-
-    def save_usage(self):
-        """
-        只在程序退出（atexit 回调）或者需要强制保存时调用，
-        将 self.daily_usage_counts 写入文件。
-        """
-        os.makedirs(self.usage_path.parent, exist_ok=True)
-        with open(self.usage_path, "w") as f:
-            json.dump(self.daily_usage_counts, f, indent=2)
-
-    def load_usage(self):
-        if self.usage_path.exists():
-            with open(self.usage_path, "r") as f:
-                self.daily_usage_counts = json.load(f)
-                self._day_tag = self.daily_usage_counts.get("which_day", "")
-            self._reset_daily_usage_if_needed()
 
     def _hash_key(self, key: Any) -> str:
         """生成密钥的哈希表示，用于内部管理"""
         return hashlib.sha256(str(key).encode("utf-8")).hexdigest()
 
+    def load_usage(self):
+        """从磁盘加载历史请求的时间戳队列（仅当 persist=True 且 usage_path 存在时）"""
+        if self.usage_path and self.usage_path.exists():
+            with open(self.usage_path, "r") as f:
+                data: Dict = json.load(f)
+            self.request_timestamps.clear()
+            for k, ts_list in data.items():
+                dq = deque(ts_list)
+                self.request_timestamps[k] = dq
+
+    def save_usage(self):
+        """将当前所有密钥的请求时间戳写入文件"""
+        if not self.usage_path:
+            return
+        os.makedirs(self.usage_path.parent, exist_ok=True)
+        data = {}
+        for k, dq in self.request_timestamps.items():
+            data[k] = list(dq)
+        with open(self.usage_path, "w") as f:
+            json.dump(data, f, indent=2)
+
     def _clean_old_requests(self, internal_key: str, current_time: float):
-        """移除超过60秒之前的请求记录以适应 RPM 限制"""
-        if internal_key not in self.request_counts:
-            self.request_counts[internal_key] = deque()
-        rq = self.request_counts[internal_key]
-        while rq and rq[0] <= current_time - 60:
-            rq.popleft()
+        """
+        根据“最大时间窗口”来统一清理过期的请求。
+        """
+        if internal_key not in self.request_timestamps:
+            self.request_timestamps[internal_key] = deque()
+
+        max_timeframe = max(rule.timeframe_s for rule in self.limits)
+        dq = self.request_timestamps[internal_key]
+
+        cutoff = current_time - max_timeframe
+        while dq and dq[0] < cutoff:
+            dq.popleft()
 
     def _is_key_available(self, internal_key: str, current_time: float) -> bool:
         """
         检查key在当前时刻是否可用：
-        - 若仍在cooldown或ban中则不可用
-        - 若cooldown/ban过期则恢复可用
-          * 若是ban过期，则重置计数器为0
-          * 若只是普通cooldown过期，不重置计数器（继续累积）
+        1. 如果仍在 cooldown 中，则不可用
+        2. 如果 cooldown 过期则恢复可用
+        3. 检查所有限速规则：只要有一个规则超出上限，就不可用
+        4. 如果不允许并发且该 key 已被占用，则不可用
         """
+        # 先判断 cooldown
         if internal_key in self.cooldown_keys:
             if current_time < self.cooldown_keys[internal_key]:
-                # 仍在cooldown/ban中
                 return False
             else:
                 del self.cooldown_keys[internal_key]
-        daily_used = self.daily_usage_counts.get(internal_key, 0)
-        if self.rpd and daily_used >= self.rpd:
-            # 当日使用数已达上限
-            return False
-        # 检查RPM限制
-        self._clean_old_requests(internal_key, current_time)
-        if len(self.request_counts[internal_key]) >= self.rpm:
-            return False
 
-        # 检查并发占用
+        # 并发限制
         if not self.allow_concurrent and internal_key in self.occupied_keys:
             return False
+
+        # 清理超时的旧请求
+        self._clean_old_requests(internal_key, current_time)
+        dq = self.request_timestamps[internal_key]
+
+        # 检查所有限速规则
+        for rule in self.limits:
+            cutoff = current_time - rule.timeframe_s
+            # recent_count = 在[cutoff, current_time]窗口内的请求数量
+            recent_count = 0
+            for t in reversed(dq):
+                if t >= cutoff:
+                    recent_count += 1
+                else:
+                    break
+            if recent_count >= rule.max_requests:
+                return False
 
         return True
 
     def _get_wait_time_for_key(self, internal_key: str, current_time: float) -> float:
         """
         计算下一个该密钥可能变为可用状态的等待时间（秒）。
-        如不可计算或需要等待很久，则返回相对时间。可能为0表示无需等待。
+        如果无法可用（比如一直在cooldown），则返回一个较大值。
         """
         wait_time = 0.0
 
         # 如果在冷却中
-        if (
-            internal_key in self.cooldown_keys
-            and current_time < self.cooldown_keys[internal_key]
-        ):
-            wait_time = max(wait_time, self.cooldown_keys[internal_key] - current_time)
+        if internal_key in self.cooldown_keys:
+            cd_end = self.cooldown_keys[internal_key]
+            if current_time < cd_end:
+                wait_time = max(wait_time, cd_end - current_time)
 
-        # 如果达到了 RPM 限制，需要等待最早一次请求时间戳满60秒后再重试
-        if (
-            internal_key in self.request_counts
-            and len(self.request_counts[internal_key]) >= self.rpm
-        ):
-            oldest_request = self.request_counts[internal_key][0]
-            rpm_wait = (oldest_request + 60) - current_time
-            wait_time = max(wait_time, rpm_wait)
-        daily_used = self.daily_usage_counts.get(internal_key, 0)
-        if self.rpd and daily_used >= self.rpd:
-            # 计算到今日结束的剩余秒数
-            now = datetime.now(timezone.utc)
-            end_of_day = datetime.combine(now.date(), dtime.max)
-            wait_time = max(wait_time, (end_of_day - now).total_seconds() + 60)
+        # 对所有限速规则计算等待时间，取最大值
+        dq = self.request_timestamps.get(internal_key, deque())
+        for rule in self.limits:
+            cutoff = current_time - rule.timeframe_s
+            recent_requests = [t for t in dq if t >= cutoff]
+            if len(recent_requests) >= rule.max_requests:
+                # 需要等到最早那次请求 + rule.timeframe_s
+                earliest_in_window = recent_requests[0]
+                rule_end = earliest_in_window + rule.timeframe_s
+                rule_wait = rule_end - current_time
+                wait_time = max(wait_time, rule_wait)
 
-        # 并发限制下，如果密钥被占用，也许只能等它被释放
+        # 并发限制下，如果被占用，也许只能等它被释放（无法准确计算，只能等 notify）
         if not self.allow_concurrent and internal_key in self.occupied_keys:
-            # 这里无法精确计算等待时间，只能设置为0，等待条件变量通知
             wait_time = max(wait_time, 0)
 
         return wait_time
@@ -197,14 +244,11 @@ class Pool(metaclass=MultiSingletonMeta):
         with self._lock:
             current_time = time.time()
             self._clean_old_requests(internal_key, current_time)
-            self.request_counts[internal_key].append(current_time)
-
-            current_count = self.daily_usage_counts.get(internal_key, 0)
-            self.daily_usage_counts[internal_key] = current_count + 1
-            self.save_usage() if self.rpd else None
+            self.request_timestamps[internal_key].append(current_time)
 
             if not self.allow_concurrent:
                 self.occupied_keys.add(internal_key)
+
             self._condition.notify_all()
 
     def release_key(self, key: Any):
@@ -234,12 +278,11 @@ class Pool(metaclass=MultiSingletonMeta):
             self._condition.notify_all()
 
     def get_available_key(self, keys: List[Any]) -> Any:
-        """获取一个可用的密钥，如果没有可用的则阻塞等待"""
+        """获取一个可用的密钥，如果没有可用则阻塞等待"""
         if not keys:
             raise ValueError("未提供任何 API 密钥")
 
         with self._lock:
-            self._reset_daily_usage_if_needed()
             while True:
                 current_time = time.time()
                 shuffled_keys = keys.copy()
@@ -247,70 +290,38 @@ class Pool(metaclass=MultiSingletonMeta):
 
                 available_keys = []
                 for key in shuffled_keys:
-                    internal_key = self._hash_key(key)
-                    if self._is_key_available(internal_key, current_time):
+                    ik = self._hash_key(key)
+                    if self._is_key_available(ik, current_time):
                         available_keys.append(key)
 
                 if available_keys:
-                    # 优先选择未被占用的密钥
-                    for key in available_keys:
-                        internal_key = self._hash_key(key)
-                        if (
-                            self.allow_concurrent
-                            or internal_key not in self.occupied_keys
-                        ):
-                            self._clean_old_requests(internal_key, current_time)
+                    for k in available_keys:
+                        ik = self._hash_key(k)
+                        if self.allow_concurrent or ik not in self.occupied_keys:
+                            self._clean_old_requests(ik, current_time)
                             if not self.allow_concurrent:
-                                self.occupied_keys.add(internal_key)
-                            return key
+                                self.occupied_keys.add(ik)
+                            return k
 
-                # 判断是否有密钥仅被占用但未冷却
-                occupied_only = [
-                    key
-                    for key in keys
-                    if self._hash_key(key) in self.occupied_keys
-                    and self._hash_key(key) not in self.cooldown_keys
-                ]
-
-                if occupied_only:
-                    # 等待被占用的密钥被释放
-                    self._condition.wait()
-                    continue  # 重新检查密钥状态
-
-                # 如果没有仅被占用的密钥，计算最小等待时间
+                # 如果没有可用的 key，计算最小等待时间
                 min_wait_time = float("inf")
                 for key in keys:
-                    internal_key = self._hash_key(key)
-                    wait_time = self._get_wait_time_for_key(internal_key, current_time)
+                    ik = self._hash_key(key)
+                    wait_time = self._get_wait_time_for_key(ik, current_time)
                     if wait_time < min_wait_time:
                         min_wait_time = wait_time
 
                 if min_wait_time == float("inf"):
                     raise RuntimeError("无法确定密钥的等待时间，可能没有可用密钥。")
 
-                if min_wait_time >= 4 * 3600:
-                    total_keys = len(keys)
-                    cooling_keys = len(self.cooldown_keys)
-                    cooldown_info = ", ".join(
-                        f"{k}: {(v - current_time) / 3600:.1f}h"
-                        for k, v in self.cooldown_keys.items()
-                    )
-                    print(
-                        f"All keys are unavailable, most likely due to daily API limits. "
-                        f"Will retry in {min_wait_time / 3600:.1f} hours, or interrupt the program to add new keys. "
-                        f"(Total keys: {total_keys}, Cooling down: {cooling_keys}, "
-                        f"Cooldown times: {cooldown_info})"
-                    )
-
-                # 等待最小的等待时间，或者在等待被释放时唤醒
                 wait_time = min_wait_time if min_wait_time > 0 else None
                 self._condition.wait(timeout=wait_time)
 
     def context(self, keys: List[Any]):
         """
         上下文管理器，用于自动释放密钥。例如：
-            with key_manager.context(keys) as key:
-                # 使用 key 进行请求
+            with pool.context(keys) as key:
+                # 使用key进行请求
         """
 
         class KeyContext:
@@ -320,18 +331,16 @@ class Pool(metaclass=MultiSingletonMeta):
                 self.entered = False
 
             def __enter__(self):
-                # 在进入上下文时标记使用请求数+1
                 self.manager.mark_key_used(self.key)
                 self.entered = True
                 return self.key
 
             def __exit__(self, exc_type, exc_val, exc_tb):
-                # 无论成功或失败，都释放密钥占用
                 if self.entered:
-                    # 如果没有异常发生，说明key使用成功，重置连续冷却计数
+                    # 如果没有异常，说明key使用正常，重置连续冷却计数
                     if exc_type is None:
-                        internal_key = self.manager._hash_key(self.key)
-                        self.manager.consecutive_cooldown_counts[internal_key] = 0
+                        ik = self.manager._hash_key(self.key)
+                        self.manager.consecutive_cooldown_counts[ik] = 0
                     self.manager.release_key(self.key)
 
         key = self.get_available_key(keys)

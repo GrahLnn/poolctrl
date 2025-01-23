@@ -1,4 +1,4 @@
-from .main import Pool
+from .main import Pool, RateLimitRule
 
 
-__all__ = ["Pool"]
+__all__ = ["Pool", "RateLimitRule"]
